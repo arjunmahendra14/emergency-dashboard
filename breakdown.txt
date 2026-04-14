@@ -1,0 +1,534 @@
+EMERGENCY INCIDENT DASHBOARD — ENGINEERING BREAKDOWN
+=====================================================
+A RapidSOS-inspired real-time emergency dispatch system powered by
+FastAPI, AWS DynamoDB, Anthropic Claude AI, and a live Seattle 911 feed.
+
+
+=======================================================
+1. PRODUCT OVERVIEW
+=======================================================
+
+What it does:
+  Real 911 incidents are pulled from Seattle's public emergency data feed
+  every 5 minutes, ingested into the system, triaged by Claude AI, stored
+  permanently in AWS DynamoDB, and displayed on a live dispatcher dashboard
+  that refreshes every 5 seconds.
+
+The full journey of one incident:
+  Seattle 911 API → seattle_ingest.py → POST /incident → DynamoDB write
+  → Claude triage → DynamoDB update → GET /incidents (polled) → Dashboard UI
+
+No human has to press anything. The system runs autonomously end-to-end.
+
+
+=======================================================
+2. SYSTEM ARCHITECTURE
+=======================================================
+
+Three independent processes run simultaneously:
+
+  [1] uvicorn main:app --port 8000
+      The FastAPI backend. Handles all HTTP requests, orchestrates
+      DynamoDB writes, and calls Claude for triage.
+
+  [2] python seattle_ingest.py
+      A background polling script. Every 5 minutes, fetches the 100
+      most recent Seattle 911 events, deduplicates using incident_number,
+      maps types, and POSTs new incidents to the backend API.
+
+  [3] npm run dev (Vite / React)
+      The dispatcher dashboard at localhost:5173. Polls GET /incidents
+      every 5 seconds and re-renders with fresh data.
+
+Separation of concerns:
+  - The ingest script knows nothing about DynamoDB or Claude — it just
+    calls the REST API. This means the same API works for both the
+    Seattle feed and any future data source.
+  - The backend knows nothing about the Seattle API — it accepts any
+    valid incident regardless of source.
+  - The frontend knows nothing about DynamoDB — it only speaks REST.
+
+
+=======================================================
+3. BACKEND ENGINEERING (FastAPI / Python)
+=======================================================
+
+File: main.py
+  - FastAPI app with 4 routes: POST /incident, GET /incidents,
+    GET /incident/{id}, GET /health
+  - Pydantic v2 models for strict request validation. The incident_type
+    field uses a regex pattern constraint: ^(medical|fire|crime|other)$
+    so invalid types are rejected at the boundary before any DB write.
+  - CORS middleware configured from FRONTEND_ORIGIN env var — origin
+    is never hardcoded.
+  - _serialize() converts DynamoDB Decimal types to float before JSON
+    serialization. This is required because DynamoDB's boto3 client
+    returns Decimal objects for all numeric fields, which are not
+    JSON-serializable by default.
+  - POST /incident follows a strict two-phase pattern:
+      Phase 1: Write raw incident to DynamoDB (always succeeds or raises)
+      Phase 2: Call Claude triage (allowed to fail)
+    A Claude failure triggers a second DynamoDB update marking the
+    record as triage_failed. The incident is never lost.
+
+File: dynamo.py
+  - All DynamoDB operations isolated here. Routes never touch boto3 directly.
+  - put_incident(): writes a new record, sets TTL = now + 7 days
+  - get_incident(): point lookup by primary key "id"
+  - scan_incidents(): full table scan with optional status filter, sorted
+    by timestamp descending in Python after retrieval
+  - update_triage(): conditional attribute update using UpdateExpression.
+    Uses ExpressionAttributeNames to alias the reserved word "status".
+  - Numeric fields stored as Decimal (not float) to satisfy DynamoDB's
+    type system. boto3 raises a TypeError if floats are passed directly.
+
+File: claude_triage.py
+  - Stateless function: takes incident fields, returns TriageResult dataclass.
+  - Model: claude-sonnet-4-5
+  - max_tokens: 300 (enough for JSON output, cheap to run)
+  - Prompt engineering: system prompt enforces JSON-only output. User
+    prompt provides all incident context in a structured template.
+  - Defensive parsing: strips markdown code fences before JSON parsing
+    (Claude occasionally wraps output in ```json``` blocks despite being
+    told not to). This was a real bug caught in production.
+  - Validates all required fields are present in the response.
+  - Normalizes priority to uppercase; defaults invalid values to MEDIUM.
+  - Clamps confidence to a Decimal with 2 decimal places.
+  - All failures raise TriageError — caller decides how to handle it.
+
+File: seattle_ingest.py
+  - Polls https://data.seattle.gov/resource/kzjm-xkqj.json
+  - Orders by datetime DESC, fetches 100 most recent events per poll
+  - In-memory deduplication using a seen set of incident_number strings.
+    Prevents the same 911 call from being ingested multiple times across
+    polling cycles.
+  - Type mapping function converts Seattle's free-text incident types
+    (e.g. "Medic Response", "ALS") to our four-category schema using
+    keyword matching.
+  - Uses caller_id = incident_number so each Seattle event has a stable,
+    traceable identifier in our system.
+  - Runs with --once flag for testing; continuous mode loops with
+    time.sleep(300) between polls.
+
+
+=======================================================
+4. AWS USAGE — DYNAMODB
+=======================================================
+
+Table: EmergencyIncidents
+Region: us-east-1
+Billing: PAY_PER_REQUEST (on-demand)
+
+Why DynamoDB was chosen:
+  - Zero infrastructure to manage. No servers, no connection pools,
+    no schema migrations.
+  - PAY_PER_REQUEST billing means cost is exactly $0 when idle. For a
+    dashboard that may sit unused overnight, this is critical.
+  - Native support for TTL — incidents auto-delete after 7 days with
+    zero application code needed.
+  - Scales automatically to handle traffic spikes (e.g. a mass-casualty
+    event triggering hundreds of simultaneous incident reports).
+
+Primary Key:
+  - Partition key: "id" (UUID4 string)
+  - No sort key. Each incident is looked up by its unique ID.
+  - UUIDs are generated in Python using uuid.uuid4() before the DB write,
+    so the ID is known client-side immediately and can be returned in the
+    API response without a second read.
+
+TTL (Time to Live):
+  - Attribute: "ttl" (Number, Unix epoch seconds)
+  - Value: int(time.time()) + 604800 (7 days)
+  - Set by put_incident() on every write.
+  - DynamoDB's TTL daemon asynchronously deletes expired items — no cron
+    job, no Lambda, no manual cleanup needed.
+
+GSI (Global Secondary Index):
+  - Name: StatusTimestampIndex
+  - Partition key: status, Sort key: timestamp
+  - Allows efficient queries like "give me all triaged incidents sorted
+    by time" without scanning the full table.
+  - Currently the backend uses scan_incidents() with a FilterExpression
+    for simplicity, but the GSI is ready for production query patterns.
+
+Write pattern (put_incident):
+  _table.put_item(Item=record)
+  - Full item write. No conditional checks — UUIDs guarantee no collision.
+  - Happens synchronously before Claude is called. This is the
+    "durability first" guarantee.
+
+Update pattern (update_triage):
+  _table.update_item(
+      Key={"id": incident_id},
+      UpdateExpression="SET ai_summary=..., priority=..., #s=:status",
+      ExpressionAttributeNames={"#s": "status"},
+      ExpressionAttributeValues={...}
+  )
+  - Uses UpdateExpression instead of a full rewrite to atomically patch
+    only the triage fields. This avoids overwriting fields written by
+    other processes.
+  - "status" is a DynamoDB reserved word, so ExpressionAttributeNames
+    aliases it as "#s". This is a common DynamoDB gotcha.
+
+Read pattern (scan_incidents):
+  _table.scan(FilterExpression=...) with pagination loop.
+  - Iterates LastEvaluatedKey until exhausted, collecting all pages.
+  - Python-side sort by timestamp descending after full retrieval.
+  - Appropriate for MVP scale. At production scale, a GSI query would
+    replace this.
+
+Credentials:
+  - AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY loaded from .env via
+    python-dotenv. Never hardcoded, never committed.
+  - boto3 resource initialized once at module load time in dynamo.py —
+    connection is reused across all requests.
+
+Decimal type handling:
+  - DynamoDB cannot store Python float. boto3 raises:
+      "Float types are not supported. Use Decimal types instead."
+  - All numeric values (latitude, longitude, confidence) are cast to
+    Decimal(str(value)) before storage and converted back to float in
+    _serialize() before returning JSON responses.
+  - This was identified as a potential silent data corruption risk and
+    enforced consistently throughout the codebase.
+
+
+=======================================================
+5. AI LAYER — ANTHROPIC CLAUDE
+=======================================================
+
+Model: claude-sonnet-4-5
+Max tokens: 300
+Purpose: Classify, summarize, and recommend action for each incident.
+
+What Claude outputs per incident:
+  - summary: 1-2 sentence plain-language description
+  - priority: CRITICAL | HIGH | MEDIUM
+  - suggested_action: specific immediate dispatcher action
+  - confidence: 0.0 to 1.0 float
+
+Prompt design:
+  - System prompt establishes the AI persona and enforces JSON-only output.
+  - User prompt provides all structured incident data (type, description,
+    coordinates, timestamp) in a consistent template format.
+  - No few-shot examples — the schema definition in the prompt is
+    sufficient for reliable structured output.
+
+Fault tolerance:
+  - All Claude calls are wrapped in try/except catching any exception
+    (API errors, timeouts, malformed responses) and converting them to
+    TriageError.
+  - The route handler catches TriageError and gracefully degrades:
+    incident is stored with status=triage_failed and a human-review flag.
+  - This means Claude can go down entirely and the system keeps working —
+    incidents are captured, just not AI-triaged.
+
+Real bug found and fixed:
+  Claude returned JSON wrapped in markdown code fences (```json...```)
+  despite explicit instructions not to. This caused json.loads() to fail
+  on every call, triggering triage_failed for all incidents. Fixed by
+  stripping the fence prefix/suffix before parsing. Lesson: always
+  defensively parse LLM structured output.
+
+
+=======================================================
+6. FRONTEND ENGINEERING (React / Vite)
+=======================================================
+
+Architecture:
+  - State lives in App.jsx. Both the sidebar and dashboard receive
+    incidents as props — no duplicate API calls, no state sync issues.
+  - fetchIncidents() is called on mount and every 5 seconds via
+    setInterval. The interval is cleaned up on unmount.
+
+Components:
+  StatsPanel.jsx (left sidebar)
+    - Displays live feed status with a pulsing green dot
+    - Shows total incident count and breakdowns by priority and type
+    - Filter buttons toggle active filters stored in App.jsx state
+    - Clicking the same filter twice clears it (toggle pattern)
+    - Clear Filters button appears only when a filter is active
+
+  Dashboard.jsx (right panel)
+    - Receives pre-filtered incidents array from App.jsx
+    - Renders IncidentCard for each incident
+    - Shows "X showing" count that reflects current filter state
+
+  IncidentCard.jsx
+    - Color-coded priority badge (CRITICAL=red, HIGH=amber, MEDIUM=green)
+    - Displays AI summary, suggested action, confidence percentage
+    - Google Maps deep link constructed from latitude/longitude
+    - Incident ID shown in monospace at bottom for dispatcher reference
+
+API layer (api.js):
+  - Axios instance with baseURL from VITE_API_BASE_URL env var,
+    defaulting to http://localhost:8000
+  - Three functions: createIncident, fetchIncidents, fetchIncident
+  - All async, return unwrapped response.data
+
+
+=======================================================
+7. DATA FLOW SUMMARY
+=======================================================
+
+  [Seattle 911 API]
+       |
+       | HTTP GET every 5 min (100 events, ordered by datetime DESC)
+       v
+  [seattle_ingest.py]
+       | deduplicates by incident_number
+       | maps type keywords → medical/fire/crime/other
+       | HTTP POST /incident for each new event
+       v
+  [FastAPI POST /incident]
+       | validates with Pydantic (type regex, required fields)
+       | generates UUID, ISO timestamp
+       |
+       |---> [DynamoDB put_item] ← ALWAYS happens first
+       |
+       |---> [Claude claude-sonnet-4-5]
+       |         | returns: summary, priority, action, confidence
+       |         v
+       |     [DynamoDB update_item] ← patches triage fields
+       |
+       | returns enriched JSON (status: triaged)
+       v
+  [React Dashboard]
+       | polls GET /incidents every 5 seconds
+       | filters by priority/type in App.jsx state
+       | renders IncidentCard per result
+       v
+  [Dispatcher sees live Seattle 911 feed, AI-triaged, filterable]
+
+
+=======================================================
+8. KEY ENGINEERING DECISIONS
+=======================================================
+
+DynamoDB write before Claude call:
+  The single most important architectural decision. Guarantees zero data
+  loss. Claude is best-effort enrichment, not a prerequisite for storage.
+
+PAY_PER_REQUEST billing:
+  Eliminates the need to predict traffic. The system costs nothing when
+  idle and scales automatically under load.
+
+In-memory deduplication in the ingest script:
+  Simple and effective for a single-process poller. The seen set lives
+  for the lifetime of the process. On restart, the script re-fetches but
+  DynamoDB's UUIDs ensure no duplicate storage — the ingest may POST
+  duplicates, but each gets a new UUID. A production system would use
+  DynamoDB's caller_id to check existence before writing.
+
+Polling over WebSockets:
+  5-second polling is simpler to build, debug, and deploy than WebSockets.
+  For emergency dispatch at this scale, a 5-second lag is acceptable.
+  WebSockets would be the next upgrade for real-time push.
+
+Decimal over float for DynamoDB:
+  boto3 enforces this at runtime — floats raise a TypeError. Using
+  Decimal(str(value)) consistently avoids precision loss and serialization
+  errors. The _serialize() helper converts back to float for JSON output.
+
+Env var configuration:
+  All secrets and environment-specific values (AWS keys, API keys, origins,
+  table names) are loaded from .env via python-dotenv. Nothing is hardcoded.
+  .env is gitignored; .env.example is committed as a template.
+
+
+=======================================================
+9. AWS UPGRADE — SQS + LAMBDA ASYNC TRIAGE
+=======================================================
+
+What changed:
+  POST /incident no longer calls Claude synchronously. Instead, it writes
+  to DynamoDB (status: pending), sends a message to SQS, and returns
+  immediately. A Lambda function consumes the SQS queue, calls Claude,
+  and updates DynamoDB (status: triaged). The dashboard picks up the
+  update on its next 5-second poll.
+
+New AWS resources:
+  SQS Queue:    EmergencyTriageQueue (us-east-1)
+  Lambda:       EmergencyTriageLambda
+  IAM Role:     EmergencyDashboardLambdaRole
+
+SQS Queue configuration:
+  - VisibilityTimeout: 120s — gives the Lambda 2 minutes to call Claude
+    before the message becomes visible again for retry
+  - MessageRetentionPeriod: 86400s (1 day) — messages persist if Lambda
+    is down, ensuring no triage jobs are lost
+  - ReceiveMessageWaitTimeSeconds: 20s — long polling, reduces empty
+    receives and cost vs. short polling every second
+  - BatchSize: 5 — Lambda processes up to 5 incidents per invocation
+  - MaximumBatchingWindow: 10s — waits up to 10s to fill a batch before
+    invoking, reducing Lambda invocations under burst load
+
+Why this matters:
+  Before: POST /incident blocked for 2-4 seconds waiting for Claude.
+    Under load (e.g. mass-casualty event), this creates a queue of
+    blocked HTTP threads and risks timeout errors.
+  After: POST /incident returns in ~50ms. Claude triage is decoupled
+    and happens asynchronously. SQS provides automatic retry if Lambda
+    fails — the message reappears after VisibilityTimeout expires.
+
+Lambda packaging problem encountered and fixed:
+  The anthropic SDK contains pydantic_core, which has compiled C
+  extensions. When packaged on macOS with a standard pip install, the
+  macOS binary (.so files) is included. Lambda runs on Linux x86_64 —
+  the macOS binary caused an ImportModuleError on first invocation.
+  Fix: pip install with --platform manylinux2014_x86_64 --only-binary=:all:
+  to force download of the Linux binary wheel regardless of host OS.
+
+Lambda update race condition encountered and fixed:
+  After updating function code, immediately calling update_function_configuration
+  raised ResourceConflictException because Lambda was still processing the
+  code update internally. Fix: call get_waiter("function_updated").wait()
+  between code update and config update.
+
+Fallback behavior:
+  main.py checks for SQS_QUEUE_URL in the environment. If not set (local
+  dev without AWS setup), it falls back to the original synchronous Claude
+  call. This means the system works locally without any AWS config.
+
+
+=======================================================
+10. AWS UPGRADE — EVENTBRIDGE + LAMBDA INGEST
+=======================================================
+
+What changed:
+  seattle_ingest.py was a long-running Python process with time.sleep(300).
+  It has been replaced by a Lambda function (SeattleIngestLambda) triggered
+  by an EventBridge scheduled rule every 5 minutes. The local process is
+  no longer needed.
+
+New AWS resources:
+  Lambda:          SeattleIngestLambda
+  EventBridge rule: SeattleIngest5Min (rate: 5 minutes)
+  DynamoDB table:  SeattleIngestSeen (dedup store)
+
+SeattleIngestSeen table:
+  - PK: incident_number (String)
+  - TTL: 7 days (matches incident TTL in main table)
+  - Purpose: stateless deduplication. Since the Lambda is ephemeral (no
+    in-memory state between invocations), it needs a persistent store to
+    track which Seattle incident_numbers have already been ingested.
+  - Uses DynamoDB conditional writes: put_item with
+    ConditionExpression="attribute_not_exists(incident_number)".
+    If the condition fails (ConditionalCheckFailedException), the incident
+    is already in the system — skip it. This is atomic and race-safe.
+
+EventBridge rule:
+  - ScheduleExpression: "rate(5 minutes)"
+  - Targets the SeattleIngestLambda ARN
+  - Lambda permission added: lambda:InvokeFunction for
+    principal events.amazonaws.com, scoped to the rule ARN
+
+Why this is better than the polling script:
+  - No process to babysit. If the script crashes, ingestion silently stops.
+    Lambda is managed — AWS restarts it, retries failed invocations, and
+    logs everything to CloudWatch automatically.
+  - Zero idle cost. Lambda charges only for actual execution time
+    (~100ms per invocation every 5 min = negligible cost).
+  - Built-in observability. Every invocation, its duration, and any errors
+    appear in CloudWatch Logs and Lambda metrics automatically.
+
+Data flow with Lambda ingest:
+  EventBridge (every 5 min)
+    → SeattleIngestLambda
+      → fetch Seattle API (urllib, no extra deps)
+      → for each new incident_number:
+          → write to SeattleIngestSeen (conditional, dedup)
+          → put_item to EmergencyIncidents (status: pending)
+          → sqs.send_message to EmergencyTriageQueue
+    → EmergencyTriageLambda (SQS-triggered)
+      → call Claude
+      → update_item in EmergencyIncidents (status: triaged)
+
+
+=======================================================
+11. BEFORE vs. AFTER — WHY AWS ADVANCED SERVICES MATTER
+=======================================================
+
+RELIABILITY
+-----------
+Before:
+  seattle_ingest.py ran as a local Python process with time.sleep(300).
+  If the process crashed, ingestion stopped silently — no alert, no retry,
+  no indication anything was wrong. You'd only notice when the dashboard
+  stopped updating.
+
+After:
+  EventBridge + Lambda is fully managed by AWS. Lambda cannot "crash" in
+  the traditional sense. If an invocation errors, AWS logs it to CloudWatch
+  automatically and the next scheduled trigger fires regardless. No human
+  intervention needed.
+
+---
+
+RESILIENCE UNDER LOAD
+---------------------
+Before:
+  POST /incident blocked the HTTP thread for 2-4 seconds waiting for Claude
+  to respond. Under burst load — a mass-casualty event generating dozens of
+  simultaneous 911 calls — threads pile up, the server saturates, and
+  requests start timing out. Incidents could be dropped.
+
+After:
+  POST /incident returns in ~50ms. The SQS queue absorbs any burst — 10
+  incidents or 10,000, they are all durably stored in the queue and
+  processed in order by Lambda. The API never blocks on Claude.
+
+---
+
+AUTOMATIC RETRY
+---------------
+Before:
+  If Claude failed mid-triage (API error, timeout, bad JSON), the incident
+  was marked triage_failed permanently. No retry. A dispatcher had to
+  manually handle it.
+
+After:
+  If the triage Lambda fails, SQS makes the message visible again after
+  the VisibilityTimeout (120s) and automatically redelivers it. The incident
+  gets another triage attempt with no code or human intervention required.
+
+---
+
+COST
+----
+Before:
+  A long-running Python process consumes compute resources 24/7, even during
+  idle periods overnight when no new incidents are coming in.
+
+After:
+  Lambda charges only for actual execution time. The ingest Lambda runs
+  ~288 times per day at ~100ms per invocation. At AWS Lambda pricing, this
+  is effectively free. Cost scales to exactly zero when the system is idle.
+
+---
+
+OBSERVABILITY
+-------------
+Before:
+  No visibility into whether the ingest script was running, how many
+  incidents it processed, how long it took, or whether it was silently
+  erroring. The only output was terminal print statements.
+
+After:
+  Every Lambda invocation automatically emits structured logs to CloudWatch:
+  invocation duration, memory used, billed duration, error type, and any
+  print() output from the function. CloudWatch Alarms can be set on error
+  rate, duration, or queue depth with no additional instrumentation.
+
+---
+
+SUMMARY TABLE
+
+  Metric              | Before (local script)     | After (Lambda + SQS)
+  --------------------|---------------------------|----------------------
+  Failure recovery    | Manual restart            | Automatic retry
+  API response time   | 2-4s (blocking Claude)    | ~50ms (async)
+  Burst handling      | Thread saturation         | SQS absorbs all load
+  Idle cost           | Constant compute           | Zero
+  Observability       | Terminal print statements | CloudWatch (automatic)
+  Ingest reliability  | Crashes silently          | Managed, retried, logged

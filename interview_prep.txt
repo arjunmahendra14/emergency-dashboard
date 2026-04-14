@@ -1,0 +1,261 @@
+EMERGENCY INCIDENT DASHBOARD — RESUME & INTERVIEW PREP
+=======================================================
+
+
+RESUME BULLET POINTS
+--------------------
+
+Project: Emergency Incident Dispatch Dashboard (RapidSOS-inspired MVP)
+
+- Built a full-stack emergency dispatch system using FastAPI, AWS DynamoDB, Anthropic Claude AI,
+  and React (Vite) — ingesting panic button events, triaging them with AI, and displaying live
+  results on a dispatcher dashboard
+
+- Designed a fault-tolerant incident pipeline where DynamoDB writes always succeed before Claude
+  triage is attempted — ensuring no incident is ever lost due to an AI service failure
+
+- Integrated the Anthropic Claude API for real-time emergency triage, generating priority
+  classification (CRITICAL / HIGH / MEDIUM), plain-language summaries, and suggested dispatcher
+  actions
+
+- Implemented DynamoDB TTL-based expiry (7-day auto-deletion) and a GSI (StatusTimestampIndex)
+  for efficient status-filtered queries without full table scans
+
+
+=======================================================
+INTERVIEW SITUATIONS (Based on Real Issues We Hit)
+=======================================================
+
+
+1. "Tell me about a time you debugged an integration issue under pressure."
+---------------------------------------------------------------------------
+
+Situation:
+  The POST /incident endpoint was consistently returning status: triage_failed even after we
+  confirmed the Anthropic API key was valid.
+
+Task:
+  Find why Claude triage was silently failing without crashing the server (by design).
+
+Action:
+  Isolated the triage call from the server and ran it directly in a Python one-liner. The error
+  immediately surfaced: Claude was returning valid JSON but wrapped in markdown code fences
+  (```json ... ```) which caused json.loads() to throw. The system prompt said "no markdown"
+  but Claude didn't always comply.
+
+Result:
+  Added a fence-stripping step before JSON parsing. Triage started succeeding with 0.95-0.98
+  confidence scores.
+
+Key Takeaway:
+  Never trust LLM output format blindly — always defensively parse. A well-designed fallback
+  (triage_failed status) meant the system stayed alive throughout, which made the bug easy to
+  diagnose without any user-facing crash.
+
+
+2. "Tell me about a time you caught a data model inconsistency."
+----------------------------------------------------------------
+
+Situation:
+  The spec defined incident_id as the DynamoDB primary key, but the running code used "id" in
+  get_item() and update_item() calls — while put_item() was storing both "id" and "incident_id"
+  on every record, making every write carry a redundant duplicate field.
+
+Task:
+  Decide which field to standardize on and fix it consistently across the entire codebase.
+
+Action:
+  Audited all three files — main.py, dynamo.py, and the Pydantic response model. Removed the
+  duplicate "incident_id" key from the record dict, dropped the Pydantic field alias, and
+  verified all DynamoDB key calls consistently used "id". No data migration needed since the
+  table was fresh.
+
+Result:
+  Clean, consistent primary key usage with no duplicate fields written to DynamoDB.
+
+Key Takeaway:
+  Spec docs and implementation can drift fast, especially early in a project. Auditing all
+  layers (API layer, DB layer, schema layer) together is more reliable than fixing one file
+  at a time.
+
+
+3. "Tell me about a time you had to deal with an invalid external dependency."
+------------------------------------------------------------------------------
+
+Situation:
+  The Claude model was specified as "claude-sonnet-4-20250514" — a model ID that doesn't exist.
+  The Anthropic API returned a 404, which the code caught and silently converted to TriageError,
+  falling back to triage_failed on every single request.
+
+Task:
+  Find the correct model ID without guessing blindly.
+
+Action:
+  Wrote a quick loop to probe a list of candidate model IDs against the live API and stopped on
+  the first successful response. Identified "claude-sonnet-4-5" as valid. Fixed in one line.
+
+Result:
+  Full triage pipeline started working end-to-end immediately after.
+
+Key Takeaway:
+  Model IDs in AI APIs are versioned strings that change frequently. Probe them programmatically
+  rather than hardcoding from memory or docs that may be out of date. The silent fallback to
+  triage_failed masked this bug completely — without direct testing, it would have been very
+  hard to find.
+
+
+4. "Tell me about a time you built a fault-tolerant system."
+-------------------------------------------------------------
+
+Situation:
+  Emergency incident data must never be lost — even if the AI triage step crashes, times out,
+  or returns garbage output.
+
+Task:
+  Design the POST /incident endpoint so a Claude failure is non-blocking.
+
+Action:
+  Structured the endpoint in two strict phases: (1) write the raw incident to DynamoDB
+  immediately, (2) call Claude triage wrapped in a try/except. On TriageError, update the
+  record with status: triage_failed and suggested_action: "Manual review required" — the
+  incident is preserved and flagged either way.
+
+Result:
+  A Claude outage degrades gracefully to manual dispatcher review rather than data loss.
+  This mirrors patterns used in real CAD (Computer-Aided Dispatch) systems where human
+  fallback is always required.
+
+Key Takeaway:
+  In safety-critical systems, the storage layer and the enrichment layer must be decoupled.
+  The enrichment (AI triage) is best-effort. The record is non-negotiable.
+
+
+5. "Tell me about a time you worked with AWS services."
+-------------------------------------------------------
+
+Situation:
+  Needed a low-ops, scalable database for storing emergency incidents with automatic expiry
+  and efficient filtering by status.
+
+Task:
+  Set up DynamoDB with the right billing mode, key schema, TTL, and indexing strategy.
+
+Action:
+  Chose PAY_PER_REQUEST billing (no capacity planning needed for an MVP), set "id" as the
+  partition key, added a "ttl" attribute (epoch seconds, 7-day expiry window), and created a
+  GSI (StatusTimestampIndex) for status-filtered queries without full table scans. Used boto3
+  with Decimal types throughout to avoid DynamoDB's float serialization errors — a common
+  gotcha that causes silent data corruption.
+
+Result:
+  Incidents auto-expire after 7 days, costs scale to zero when idle, and status filtering is
+  index-backed. Debugged a live UnrecognizedClientException by tracing it to empty AWS
+  credentials in the .env file.
+
+Key Takeaway:
+  DynamoDB requires Decimal (not float) for numeric types — floats will either throw or
+  silently lose precision. Always validate credentials are actually loaded before assuming
+  an AWS error is a permissions or config issue.
+
+
+=======================================================
+UPGRADE: SQS + Lambda + EventBridge (Advanced AWS)
+=======================================================
+
+
+6. "Tell me about a time you decoupled a synchronous bottleneck."
+-----------------------------------------------------------------
+
+Situation:
+  POST /incident was calling Claude synchronously — blocking the HTTP
+  response for 2-4 seconds per incident. Under burst load (e.g. a
+  mass-casualty event generating hundreds of simultaneous 911 calls),
+  this would exhaust thread pool capacity and cause timeouts.
+
+Task:
+  Make triage asynchronous without losing any incidents or triage results.
+
+Action:
+  Replaced the synchronous Claude call with an SQS enqueue. The endpoint
+  now writes to DynamoDB (status: pending) and sends a message to
+  EmergencyTriageQueue, then returns in ~50ms. A Lambda function — triggered
+  by SQS with a batch size of 5 and 10-second batch window — consumes the
+  queue, calls Claude, and updates DynamoDB. The dashboard picks up the
+  triaged status on its next 5-second poll. Kept the original synchronous
+  path as a fallback when SQS_QUEUE_URL is not set, so local dev works
+  without AWS.
+
+Result:
+  POST /incident response time dropped from ~3s to ~50ms. Triage is now
+  retry-safe — if Lambda fails, SQS redelivers the message after the
+  VisibilityTimeout (120s). No incidents are lost.
+
+Key Takeaway:
+  SQS VisibilityTimeout is critical to get right. Set it shorter than the
+  Lambda timeout and you get duplicate processing. Set it too long and
+  failed messages take forever to retry. 120s gave enough headroom for a
+  slow Claude call without allowing long stalls on failure.
+
+
+7. "Tell me about a time you replaced a fragile background process with managed infrastructure."
+-----------------------------------------------------------------------------------------------
+
+Situation:
+  The Seattle 911 feed was ingested by seattle_ingest.py — a long-running
+  Python script with time.sleep(300). If it crashed, ingestion stopped
+  silently. There was no alerting, no retry, and no visibility into whether
+  it was running.
+
+Task:
+  Replace it with something that runs reliably without babysitting.
+
+Action:
+  Deployed SeattleIngestLambda and created an EventBridge scheduled rule
+  (rate: 5 minutes) to trigger it. Since Lambda is stateless (no in-memory
+  seen set between invocations), I created a SeattleIngestSeen DynamoDB
+  table for dedup. Used conditional writes — put_item with
+  attribute_not_exists(incident_number) — so duplicate ingestion is
+  prevented atomically without a read-before-write pattern. The table TTL
+  matches the main incidents table (7 days) so it self-cleans.
+
+Result:
+  Ingestion runs on a managed schedule. Errors surface in CloudWatch Logs
+  automatically. Zero idle cost (Lambda charges ~100ms per invocation).
+  No process to monitor or restart.
+
+Key Takeaway:
+  Stateless Lambda functions need external state for anything that was
+  previously in-memory (like a seen set). DynamoDB conditional writes are
+  the right tool — they're atomic, cheap, and eliminate the need for
+  a read-before-write round trip.
+
+
+8. "Tell me about a time you debugged a platform compatibility issue."
+---------------------------------------------------------------------
+
+Situation:
+  After deploying the triage Lambda, every invocation failed immediately
+  with: Runtime.ImportModuleError: No module named 'pydantic_core._pydantic_core'
+
+Task:
+  Understand why the import failed on Lambda but not locally, and fix
+  the deployment package.
+
+Action:
+  The anthropic SDK depends on pydantic, which uses pydantic_core — a
+  Rust extension compiled into a platform-specific binary (.so file).
+  The packaging step ran pip install on macOS, which downloaded the macOS
+  binary. Lambda runs on Linux x86_64 — incompatible binary. Fixed by
+  adding pip flags: --platform manylinux2014_x86_64 --only-binary=:all:
+  --python-version 3.12. This forces pip to download the Linux wheel
+  regardless of what OS the packaging runs on.
+
+Result:
+  Lambda imported successfully. Triage started working end-to-end.
+
+Key Takeaway:
+  Any Python package with native extensions (pydantic, numpy, cryptography,
+  etc.) must be cross-compiled when packaging for Lambda from macOS or
+  Windows. manylinux2014_x86_64 is the correct target for Lambda's default
+  runtime. This is a common gotcha that's hard to debug because the error
+  only surfaces at Lambda invocation time, not during packaging.

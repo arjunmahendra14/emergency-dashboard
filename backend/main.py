@@ -24,11 +24,9 @@ _sqs = boto3.client("sqs", region_name=os.getenv("AWS_REGION", "us-east-1")) if 
 
 app = FastAPI(title="Emergency Incident API", version="1.0.0")
 
-_cors_origins = [o.strip() for o in os.getenv("FRONTEND_ORIGIN", "http://localhost:5173").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )

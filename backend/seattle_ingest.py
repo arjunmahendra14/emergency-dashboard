@@ -16,7 +16,7 @@ import time
 import requests
 
 SEATTLE_API = "https://data.seattle.gov/resource/kzjm-xkqj.json"
-DASHBOARD_API = os.getenv("DASHBOARD_API", "https://emergency-dashboard-production-a6bb.up.railway.app/incident")
+DASHBOARD_API = os.getenv("DASHBOARD_API", "http://peaceful-comfort.railway.internal:8080/incident")
 POLL_INTERVAL = 300  # 5 minutes
 
 # Map Seattle incident types to our schema

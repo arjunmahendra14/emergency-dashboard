@@ -1,4 +1,5 @@
-import { MapContainer, TileLayer, CircleMarker, Popup } from 'react-leaflet'
+import { useEffect, useRef } from 'react'
+import { MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet'
 import 'leaflet/dist/leaflet.css'
 
 const PRIORITY_COLORS = {
@@ -20,13 +21,32 @@ const TYPE_ICONS = {
   other:   '⚠️',
 }
 
-// Seattle center
 const SEATTLE = [47.6062, -122.3321]
 
-export default function MapView({ incidents, onResolve }) {
+function MapController({ selectedIncident }) {
+  const map = useMap()
+  useEffect(() => {
+    if (selectedIncident) {
+      map.flyTo([selectedIncident.latitude, selectedIncident.longitude], 15, { duration: 0.8 })
+    }
+  }, [selectedIncident, map])
+  return null
+}
+
+export default function MapView({ incidents, onResolve, selectedId, onSelect }) {
+  const markerRefs = useRef({})
+
   const active = incidents.filter(
     (i) => i.status !== 'resolved' && i.latitude && i.longitude
   )
+
+  const selectedIncident = active.find((i) => i.id === selectedId) || null
+
+  useEffect(() => {
+    if (selectedId && markerRefs.current[selectedId]) {
+      markerRefs.current[selectedId].openPopup()
+    }
+  }, [selectedId])
 
   return (
     <MapContainer
@@ -42,21 +62,27 @@ export default function MapView({ incidents, onResolve }) {
         maxZoom={19}
       />
 
+      <MapController selectedIncident={selectedIncident} />
+
       {active.map((incident) => {
+        const isSelected = incident.id === selectedId
         const color = PRIORITY_COLORS[incident.priority] || '#888'
-        const radius = PRIORITY_RADIUS[incident.priority] || 7
+        const baseRadius = PRIORITY_RADIUS[incident.priority] || 7
+        const radius = isSelected ? baseRadius + 6 : baseRadius
 
         return (
           <CircleMarker
             key={incident.id}
+            ref={(r) => { if (r) markerRefs.current[incident.id] = r }}
             center={[incident.latitude, incident.longitude]}
             radius={radius}
             pathOptions={{
-              color: color,
+              color: isSelected ? '#fff' : color,
               fillColor: color,
               fillOpacity: 0.85,
-              weight: 2,
+              weight: isSelected ? 3 : 2,
             }}
+            eventHandlers={{ click: () => onSelect && onSelect(incident.id) }}
           >
             <Popup>
               <div style={popupStyles.container}>

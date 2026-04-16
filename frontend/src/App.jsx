@@ -10,6 +10,7 @@ const PRIORITY_ORDER = { CRITICAL: 0, HIGH: 1, MEDIUM: 2 }
 export default function App() {
   const [incidents, setIncidents] = useState([])
   const [lastUpdated, setLastUpdated] = useState(null)
+  const [selectedId, setSelectedId] = useState(null)
 
   const load = useCallback(async () => {
     try {
@@ -88,7 +89,7 @@ export default function App() {
       <div style={styles.body}>
         {/* Map — 65% */}
         <div style={styles.mapPane}>
-          <MapView incidents={incidents} onResolve={handleResolve} />
+          <MapView incidents={incidents} onResolve={handleResolve} selectedId={selectedId} onSelect={setSelectedId} />
         </div>
 
         {/* Incident list — 35% */}
@@ -108,6 +109,8 @@ export default function App() {
                 key={incident.id}
                 incident={incident}
                 onResolve={handleResolve}
+                selected={incident.id === selectedId}
+                onSelect={setSelectedId}
               />
             ))}
           </div>

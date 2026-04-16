@@ -24,7 +24,7 @@ function formatTime(isoString) {
   catch { return isoString }
 }
 
-export default function IncidentCard({ incident, onResolve }) {
+export default function IncidentCard({ incident, onResolve, selected, onSelect }) {
   const {
     id, incident_type, description, latitude, longitude,
     timestamp, status, ai_summary, priority, suggested_action, confidence,
@@ -36,7 +36,7 @@ export default function IncidentCard({ incident, onResolve }) {
   const mapsUrl = `https://www.google.com/maps?q=${latitude},${longitude}`
 
   return (
-    <div style={styles.card(resolved)}>
+    <div style={styles.card(resolved, selected)} onClick={() => onSelect && onSelect(id)}>
       <div style={styles.header}>
         <div style={styles.leftHeader}>
           {priority && (
@@ -83,16 +83,18 @@ export default function IncidentCard({ incident, onResolve }) {
 }
 
 const styles = {
-  card: (resolved) => ({
-    background: resolved ? '#0f0f1a' : '#16213e',
-    border: `1px solid ${resolved ? '#1a1a2e' : '#2a2a5a'}`,
+  card: (resolved, selected) => ({
+    background: resolved ? '#0f0f1a' : selected ? '#1a2a4a' : '#16213e',
+    border: `1px solid ${selected ? '#4fc3f7' : resolved ? '#1a1a2e' : '#2a2a5a'}`,
     borderRadius: 8,
     padding: '12px 14px',
     display: 'flex',
     flexDirection: 'column',
     gap: 8,
     opacity: resolved ? 0.5 : 1,
-    transition: 'opacity 0.3s',
+    transition: 'all 0.2s',
+    cursor: 'pointer',
+    boxShadow: selected ? '0 0 0 2px #4fc3f7' : 'none',
   }),
   header: {
     display: 'flex',

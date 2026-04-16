@@ -33,13 +33,16 @@ function MapController({ selectedIncident }) {
   return null
 }
 
-function RecenterButton() {
+function RecenterButton({ onSelect }) {
   const map = useMap()
   return (
     <button
       style={recenterStyle}
       title="Reset view"
-      onClick={() => map.flyTo(SEATTLE, 12, { duration: 0.8 })}
+      onClick={() => {
+        map.flyTo(SEATTLE, 12, { duration: 0.8 })
+        onSelect && onSelect(null)
+      }}
     >
       ⊕
     </button>
@@ -76,7 +79,7 @@ export default function MapView({ incidents, onResolve, selectedId, onSelect }) 
       />
 
       <MapController selectedIncident={selectedIncident} />
-      <RecenterButton />
+      <RecenterButton onSelect={onSelect} />
 
       {active.map((incident) => {
         const isSelected = incident.id === selectedId

@@ -9,13 +9,14 @@ Usage:
 """
 
 import argparse
+import os
 import sys
 import time
 
 import requests
 
 SEATTLE_API = "https://data.seattle.gov/resource/kzjm-xkqj.json"
-DASHBOARD_API = "http://localhost:8000/incident"
+DASHBOARD_API = os.getenv("DASHBOARD_API", "http://localhost:8000/incident")
 POLL_INTERVAL = 300  # 5 minutes
 
 # Map Seattle incident types to our schema

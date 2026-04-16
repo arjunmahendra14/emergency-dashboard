@@ -33,6 +33,19 @@ function MapController({ selectedIncident }) {
   return null
 }
 
+function RecenterButton() {
+  const map = useMap()
+  return (
+    <button
+      style={recenterStyle}
+      title="Reset view"
+      onClick={() => map.flyTo(SEATTLE, 12, { duration: 0.8 })}
+    >
+      ⊕
+    </button>
+  )
+}
+
 export default function MapView({ incidents, onResolve, selectedId, onSelect }) {
   const markerRefs = useRef({})
 
@@ -63,6 +76,7 @@ export default function MapView({ incidents, onResolve, selectedId, onSelect }) 
       />
 
       <MapController selectedIncident={selectedIncident} />
+      <RecenterButton />
 
       {active.map((incident) => {
         const isSelected = incident.id === selectedId
@@ -113,6 +127,25 @@ export default function MapView({ incidents, onResolve, selectedId, onSelect }) 
       })}
     </MapContainer>
   )
+}
+
+const recenterStyle = {
+  position: 'absolute',
+  bottom: 32,
+  right: 12,
+  zIndex: 1000,
+  width: 34,
+  height: 34,
+  borderRadius: '50%',
+  background: '#16213e',
+  border: '2px solid #4fc3f7',
+  color: '#4fc3f7',
+  fontSize: '1.2rem',
+  lineHeight: '30px',
+  textAlign: 'center',
+  cursor: 'pointer',
+  boxShadow: '0 2px 8px rgba(0,0,0,0.5)',
+  padding: 0,
 }
 
 const popupStyles = {
